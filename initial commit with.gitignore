@@ -1,0 +1,4 @@
+# Excel 임시 파일 방지
+~$*.xlsx
+~$*.xlsm
+*.tmp
