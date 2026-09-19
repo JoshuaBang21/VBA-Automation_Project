@@ -49,6 +49,30 @@ from core.storage import (
 )
 from core.validator import upcharge_check, validate
 
+
+def _format_excel_fob(writer: pd.ExcelWriter) -> None:
+    """Keep FOB values visible with two decimal places in exported workbooks."""
+    worksheet = writer.sheets.get("PO_Line")
+    if worksheet is None:
+        return
+    fob_column = next(
+        (
+            cell.column
+            for cell in worksheet[1]
+            if cell.value == "fob"
+        ),
+        None,
+    )
+    if fob_column is None:
+        return
+    for row in worksheet.iter_rows(
+        min_row=2,
+        min_col=fob_column,
+        max_col=fob_column,
+    ):
+        row[0].number_format = "0.00"
+
+
 st.set_page_config(page_title="PO 검증 대시보드", layout="wide")
 st.markdown(
     """
@@ -93,80 +117,69 @@ st.caption(
     "EDI 수량검증은 하지 않음 (PO 자기검증 3단)."
 )
 
+if "upload_widget_version" not in st.session_state:
+    st.session_state.upload_widget_version = 0
+
 uploaded_files = st.file_uploader(
-    "PO PDF 업로드 (여러 건 동시 가능)", type=["pdf"], accept_multiple_files=True
+    "PO PDF 업로드 (여러 건 동시 가능)",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key=f"uploaded_po_files_{st.session_state.upload_widget_version}",
+)
+st.markdown(
+    """
+    <style>
+    [data-testid="stFileUploaderFile"] {
+        display: none;
+    }
+    [data-testid="stFileUploaderPagination"] {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.markdown("**네트워크 PO 폴더에서 추가**")
-network_po_root = st.text_input(
-    "PO 폴더 경로",
-    value=r"\\Diskstation\영업4부\▶▶AEO MENS CUT&SEW◀◀\PO",
-    help="하위 폴더까지 검색합니다. 네트워크 드라이브에 접근 권한이 있어야 합니다.",
-)
-if "network_po_files" not in st.session_state:
-    st.session_state.network_po_files = []
-
-if st.button("🔎 네트워크 폴더 검색", key="scan_network_po"):
-    root = Path(network_po_root.strip())
-    if not network_po_root.strip():
-        st.error("PO 폴더 경로를 입력하세요.")
-    elif not root.exists() or not root.is_dir():
-        st.error(f"접근할 수 없는 폴더입니다: {network_po_root}")
-    else:
-        try:
-            st.session_state.network_po_files = sorted(
-                (p for p in root.rglob("*.pdf") if p.is_file()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if not st.session_state.network_po_files:
-                st.warning("하위 폴더에서 PDF를 찾지 못했습니다.")
-        except OSError as e:
-            st.error(f"네트워크 폴더를 검색하지 못했습니다: {e}")
-
-network_files = st.session_state.network_po_files
-selected_network_files = []
-if network_files:
-    selected_network_files = st.multiselect(
-        f"검색된 PDF {len(network_files)}건 중 추가할 PO 선택",
-        options=network_files,
-        default=[],
-        format_func=lambda p: str(p.relative_to(Path(network_po_root))),
-        key="selected_network_po_files",
-    )
+if uploaded_files:
+    st.markdown("**선택된 PO PDF**")
+    displayed_files = min(len(uploaded_files), 20)
+    for row in range(5):
+        columns = st.columns(4)
+        for column in range(4):
+            file_index = column * 5 + row
+            if file_index < displayed_files:
+                columns[column].caption(uploaded_files[file_index].name)
+    if len(uploaded_files) > 20:
+        st.warning("처음 20개만 목록에 표시되지만, 선택한 PDF는 모두 처리됩니다.")
 
 if "results" not in st.session_state:
     st.session_state.results = {}  # po_no -> {parsed, result, df, upcharge_df}
 if "confirmed" not in st.session_state:
     st.session_state.confirmed = set()
+if "processed_upload_hashes" not in st.session_state:
+    st.session_state.processed_upload_hashes = set()
 
 
 # ---------------------------------------------------------------------------
 # 파싱 + 검증
 # ---------------------------------------------------------------------------
 def _read_uploaded_file(file_obj) -> tuple[bytes, str, str | None]:
-    return file_obj.read(), file_obj.name, None
-
-
-def _read_network_file(path: Path) -> tuple[bytes, str, str | None]:
-    modified_at = datetime.fromtimestamp(
-        path.stat().st_mtime, tz=timezone.utc
-    ).isoformat(timespec="seconds")
-    return path.read_bytes(), str(path), modified_at
+    return file_obj.getvalue(), file_obj.name, None
 
 
 sources: list[tuple[bytes, str, str | None]] = []
 if uploaded_files:
     sources.extend(_read_uploaded_file(f) for f in uploaded_files)
-sources.extend(_read_network_file(p) for p in selected_network_files)
 
 if sources:
     for pdf_bytes, filename, source_modified_at in sources:
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if file_hash in st.session_state.processed_upload_hashes:
+            continue
         try:
             parsed = parse_po_pdf(pdf_bytes, filename=filename)
             result, df = validate(parsed)
             up_df = upcharge_check(df, threshold)
-            file_hash = hashlib.sha256(pdf_bytes).hexdigest()
             header_fields = {
                 "po_no": parsed.header.po_no,
                 "style_no": parsed.header.style_no,
@@ -177,6 +190,7 @@ if sources:
                 "flow_type": parsed.header.flow_type,
                 "floorset": parsed.header.floorset,
                 "total_order_units": parsed.header.total_order_units,
+                "hand_over": parsed.header.hand_over,
             }
             save_status = save_po(
                 df_line=df,
@@ -195,12 +209,14 @@ if sources:
                 "save_status": save_status,
                 "source_modified_at": source_modified_at,
             }
+            st.session_state.processed_upload_hashes.add(file_hash)
         except PoParseError as e:
             message = str(e)
             prefix = f"{Path(filename).name}: "
             if message.startswith(prefix):
                 message = message[len(prefix):]
             st.error(f"❌ {Path(filename).name}: {message}")
+            st.session_state.processed_upload_hashes.add(file_hash)
 
 if not st.session_state.results:
     st.info("PO PDF를 업로드하면 자동으로 파싱·검증됩니다.")
@@ -210,6 +226,14 @@ if not st.session_state.results:
 # ---------------------------------------------------------------------------
 # 상단 요약 대시보드 (경고등)
 # ---------------------------------------------------------------------------
+def _reset_po_upload():
+    st.session_state.results = {}
+    st.session_state.confirmed = set()
+    st.session_state.processed_upload_hashes = set()
+    st.session_state.upload_widget_version += 1
+
+
+st.button("초기화", key="reset_po_upload", on_click=_reset_po_upload)
 st.subheader("1️⃣ 검증 요약")
 
 summary_rows = []
@@ -220,7 +244,6 @@ for po_no, item in st.session_state.results.items():
     summary_rows.append({
         "상태": icon,
         "PO번호": po_no,
-        "파일명": item["filename"],
         "데이터 상태": {
             "saved": "최신 저장",
             "unchanged": "최신 유지",
@@ -228,12 +251,14 @@ for po_no, item in st.session_state.results.items():
         }.get(item.get("save_status"), "확인 필요"),
         "PDF 수정일시": item.get("source_modified_at"),
         "Style": item["parsed"].header.style_no,
+        "HO": item["parsed"].header.hand_over,
         "Color 수": len(r.color_checks),
         "COLOR SUMMARY 합": r.sum_of_colors,
         "TOTAL ORDER SUMMARY": r.order_units,
         "Size별합계일치": "OK" if size_level_ok else "불일치",
         "PO전체합계일치": "OK" if r.color_sum_vs_order_ok else "불일치",
         "확인(CFM) 완료": "✅" if po_no in st.session_state.confirmed else "",
+        "파일명": item["filename"],
     })
 
 summary_df = pd.DataFrame(summary_rows)
@@ -246,8 +271,33 @@ def _highlight_status(row):
 
 
 st.dataframe(
-    summary_df.style.set_properties(**{"background-color": "#000000", "color": "#FFFFFF"})
+    summary_df.style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    ).set_properties(
+        **{"background-color": "#000000", "color": "#FFFFFF", "text-align": "center"}
+    ).format(
+        {
+            "COLOR SUMMARY 합": "{:,.0f}",
+            "TOTAL ORDER SUMMARY": "{:,.0f}",
+        },
+        na_rep="",
+    )
+                     .set_properties(
+                         subset=["COLOR SUMMARY 합", "TOTAL ORDER SUMMARY"],
+                         **{"text-align": "right"},
+                     )
+                     .set_properties(
+                         subset=[
+                             "Style",
+                             "HO",
+                             "Color 수",
+                             "Size별합계일치",
+                             "PO전체합계일치",
+                         ],
+                         **{"text-align": "center"},
+                     )
                      .apply(_highlight_status, axis=1),
+    hide_index=True,
     use_container_width=True,
 )
 
@@ -303,6 +353,7 @@ current_headers = pd.DataFrame([
         "selling_channel": item["parsed"].header.selling_channel,
         "flow_type": item["parsed"].header.flow_type,
         "floorset": item["parsed"].header.floorset,
+        "hand_over": item["parsed"].header.hand_over,
         "total_order_units": item["parsed"].header.total_order_units,
         "validation_status": item["result"].status,
         "filename": item["filename"],
@@ -329,6 +380,7 @@ with pd.ExcelWriter(current_excel, engine="openpyxl") as writer:
     current_lines.to_excel(writer, sheet_name="PO_Line", index=False)
     current_validation.to_excel(writer, sheet_name="PO_Validation", index=False)
     current_upcharge.to_excel(writer, sheet_name="Upcharge_Review", index=False)
+    _format_excel_fob(writer)
 
 # ---------------------------------------------------------------------------
 # PO별 상세 + CFM
@@ -446,7 +498,17 @@ try:
     if headers_df.empty:
         st.caption("아직 저장된 PO가 없습니다.")
     else:
-        st.dataframe(headers_df, use_container_width=True)
+        st.dataframe(
+            headers_df.style.set_table_styles(
+                [{"selector": "th", "props": [("text-align", "center")]}]
+            ).set_properties(
+                **{"text-align": "center"}
+            ).set_properties(
+                subset=["total_order_units"],
+                **{"text-align": "right"},
+            ),
+            use_container_width=True,
+        )
         lines_df = load_all_lines()
         validation_df = load_all_validation()
         upcharge_df = load_all_upcharge()
@@ -456,6 +518,7 @@ try:
             lines_df.to_excel(writer, sheet_name="PO_Line", index=False)
             validation_df.to_excel(writer, sheet_name="PO_Validation", index=False)
             upcharge_df.to_excel(writer, sheet_name="Upcharge_Review", index=False)
+            _format_excel_fob(writer)
         current_download, saved_download = st.columns(2)
         with current_download:
             st.download_button(

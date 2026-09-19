@@ -50,6 +50,10 @@ streamlit run app/app.py
 `전체 누적 PO를 Excel로 다운로드` 버튼은 지금까지 저장된 최신 PO 전체를
 `MMDDYY_TOTAL_PO.xlsx` 형식으로 다운로드합니다. 두 파일 모두 `PO_Header`, `PO_Line`,
 `PO_Validation`, `Upcharge_Review` 시트를 포함합니다.
+`PO_Header`에는 PO의 Hand Over(포워더 전달 납기준수일)가 `total_order_units` 다음
+컬럼에 `mm/dd/yy` 형식으로 저장됩니다. Hand Over 날짜가 없는 PDF는 저장하지 않고
+확인 오류로 표시합니다. PO 내 Color/pack별 Hand Over 날짜가 서로 다르면
+PO 단일 Header로 저장할 수 없으므로 별도 확인이 필요합니다.
 
 ### 네트워크 PO 폴더에서 추가
 

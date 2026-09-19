@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS my_po_header (
     flow_type       TEXT,
     floorset        TEXT,
     total_order_units INTEGER,
+    hand_over       TEXT,
     validated       INTEGER,      -- 1 = 자기검증 통과, 0 = 강제저장(override)
     confirmed_by    TEXT,
     confirmed_at    TEXT,
@@ -88,7 +89,7 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(my_po_header)")}
-    for name in ("source_path", "source_modified_at", "file_hash"):
+    for name in ("source_path", "source_modified_at", "file_hash", "hand_over"):
         if name not in columns:
             conn.execute(f"ALTER TABLE my_po_header ADD COLUMN {name} TEXT")
     line_columns = {row[1] for row in conn.execute("PRAGMA table_info(my_po_line)")}
@@ -115,7 +116,8 @@ def save_po(
     try:
         po_no = header_fields["po_no"]
         existing = conn.execute(
-            """SELECT file_hash, source_modified_at, channel_type, selling_channel
+            """SELECT file_hash, source_modified_at, channel_type, selling_channel,
+                      hand_over
                FROM my_po_header WHERE po_no = ?""",
             (po_no,),
         ).fetchone()
@@ -162,6 +164,7 @@ def save_po(
         header_needs_refresh = existing and (
             existing[2] != header_fields.get("channel_type")
             or existing[3] != header_fields.get("selling_channel")
+            or existing[4] != header_fields.get("hand_over")
         )
         if (
             existing
@@ -181,9 +184,9 @@ def save_po(
             """INSERT INTO my_po_header
                (po_no, style_no, factory_code, factory_name, channel_type,
                 selling_channel, flow_type, floorset, total_order_units,
-                validated, confirmed_by, confirmed_at, source_path,
+                hand_over, validated, confirmed_by, confirmed_at, source_path,
                 source_modified_at, file_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 po_no,
                 header_fields.get("style_no"),
@@ -194,6 +197,7 @@ def save_po(
                 header_fields.get("flow_type"),
                 header_fields.get("floorset"),
                 header_fields.get("total_order_units"),
+                header_fields.get("hand_over"),
                 int(validated),
                 confirmed_by,
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -258,7 +262,15 @@ def save_po(
 def load_all_headers(db_path: str = DB_PATH) -> pd.DataFrame:
     conn = get_connection(db_path)
     try:
-        return pd.read_sql_query("SELECT * FROM my_po_header ORDER BY confirmed_at DESC", conn)
+        return pd.read_sql_query(
+            """SELECT po_no, style_no, factory_code, factory_name, channel_type,
+                      selling_channel, flow_type, floorset, hand_over,
+                      total_order_units, validated, confirmed_by, source_path,
+                      source_modified_at, confirmed_at, file_hash
+               FROM my_po_header
+               ORDER BY confirmed_at DESC""",
+            conn,
+        )
     finally:
         conn.close()
 

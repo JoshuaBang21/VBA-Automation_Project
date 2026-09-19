@@ -31,6 +31,17 @@ class PoParseError(Exception):
     """PO PDF에서 헤더/라인을 추출하지 못했을 때."""
 
 
+def _normalize_factory_name(name: str | None) -> str | None:
+    if not name:
+        return name
+    normalized = name.strip()
+    if normalized.upper() == "SESHIN VN2 CO., LTD.":
+        return "VN2"
+    if normalized.upper().startswith("PT"):
+        return "PT.SSI"
+    return normalized
+
+
 @dataclass
 class PoLine:
     color_code: str
@@ -58,6 +69,7 @@ class PoHeader:
     delivery_raw: str | None
     flow_type: str | None
     total_order_units: int | None
+    hand_over: str | None
 
 
 @dataclass
@@ -114,6 +126,7 @@ def parse_header(page1_text: str) -> PoHeader:
         delivery_raw=delivery,
         flow_type=classify_flow(delivery),
         total_order_units=_clean_num(total_units_raw) if total_units_raw else None,
+        hand_over=None,
     )
 
 
@@ -127,6 +140,25 @@ _STORE_TYPE_RE = re.compile(
     r"(\d\d/\d\d/\d\d)\s+(\d\d/\d\d/\d\d)\s+([\d,]+\.\d\d)\s+(\S+)",
     re.DOTALL,
 )
+
+_HAND_OVER_RE = re.compile(
+    r"Start Ship\s+Hand Over.*?\n\s*"
+    r"(\d\d/\d\d/\d\d)\s+(\d\d/\d\d/\d\d)",
+    re.DOTALL,
+)
+
+
+def _extract_hand_over(pages: list[str]) -> str | None:
+    dates = []
+    for page in pages:
+        dates.extend(match.group(2) for match in _HAND_OVER_RE.finditer(page))
+    unique_dates = set(dates)
+    if len(unique_dates) > 1:
+        raise PoParseError(
+            "PO 내 Hand Over 날짜가 Color/상품별로 서로 다릅니다 — "
+            "PO_Header 단일 날짜로 저장할 수 없습니다."
+        )
+    return dates[0] if dates else None
 
 
 def _extract_color_segments(page_text: str) -> list[tuple[re.Match, str]]:
@@ -207,10 +239,22 @@ def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, dict]]:
         if line_m:
             total_line_qty = _clean_num(line_m.group(1))
 
-        blocks.setdefault(color_m.group(1), {})[kind] = {
-            "quantities": quantities,
-            "total_line_qty": total_line_qty,
-        }
+        color_blocks = blocks.setdefault(color_m.group(1), {})
+        existing = color_blocks.get(kind)
+        if existing is None:
+            color_blocks[kind] = {
+                "quantities": quantities,
+                "total_line_qty": total_line_qty,
+            }
+        elif len(existing["quantities"]) == len(quantities):
+            existing["quantities"] = [
+                previous + current
+                for previous, current in zip(existing["quantities"], quantities)
+            ]
+            if total_line_qty is not None:
+                existing["total_line_qty"] = (
+                    (existing["total_line_qty"] or 0) + total_line_qty
+                )
     return blocks
 
 
@@ -317,7 +361,7 @@ def parse_line_page(
     fac_m = re.search(r"Factory:\s*(\d+)\s*-\s*(.+)", page_text)
     if fac_m:
         header.factory_code = fac_m.group(1)
-        header.factory_name = fac_m.group(2).strip()
+        header.factory_name = _normalize_factory_name(fac_m.group(2))
 
     store_matches = list(_STORE_TYPE_RE.finditer(page_text))
     store_m = store_matches[0] if store_matches else None
@@ -374,7 +418,14 @@ def parse_line_page(
                     )
                 )
         else:
-            line_specs.append((pack_type, [q for _, q in pairs], total_line_qty))
+            block = color_pack_blocks.get(pack_type)
+            line_specs.append(
+                (
+                    pack_type,
+                    [q for _, q in pairs],
+                    block["total_line_qty"] if block else total_line_qty,
+                )
+            )
 
         for line_pack_type, quantities, line_total in line_specs:
             for (lbl, _), q in zip(pairs, quantities):
@@ -410,6 +461,11 @@ def parse_po_pdf(pdf_bytes: bytes, filename: str = "") -> ParsedPo:
     """PO PDF 1건 전체 파싱 (헤더 + 모든 Color/Size 라인)."""
     pages = extract_pages_text(pdf_bytes)
     header = parse_header(pages[0])
+    header.hand_over = _extract_hand_over(pages)
+    if header.hand_over is None:
+        raise PoParseError(
+            f"{filename}: Hand Over 날짜를 찾지 못했습니다 — 납기준수일 확인이 필요합니다."
+        )
 
     all_lines: list[PoLine] = []
     all_warnings: list[str] = []
