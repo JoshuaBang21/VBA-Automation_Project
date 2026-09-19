@@ -118,7 +118,7 @@ def parse_header(page1_text: str) -> PoHeader:
 
 
 _COLOR_START_RE = re.compile(
-    r"Color:\s*(\d+)\s*-\s*(.+?)\s*Design Color:\s*(.+?)\n"
+    r"Color:\s*(\d+)\s*-\s*(.+?)\s*Design Color:\s*(.+?)(?:\n|$)"
 )
 
 _STORE_TYPE_RE = re.compile(
