@@ -1,0 +1,5 @@
+streamlit>=1.36
+pandas>=2.0
+pdfplumber>=0.11
+# LLM fallback을 실제로 쓸 때만 필요:
+# anthropic>=0.34
