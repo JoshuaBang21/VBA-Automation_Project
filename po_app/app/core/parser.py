@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import re
+from datetime import datetime
 from dataclasses import dataclass, field
 
 import pdfplumber
@@ -158,7 +159,9 @@ def _extract_hand_over(pages: list[str]) -> str | None:
             "PO 내 Hand Over 날짜가 Color/상품별로 서로 다릅니다 — "
             "PO_Header 단일 날짜로 저장할 수 없습니다."
         )
-    return dates[0] if dates else None
+    if not dates:
+        return None
+    return datetime.strptime(dates[0], "%m/%d/%y").strftime("%Y-%m-%d")
 
 
 def _extract_color_segments(page_text: str) -> list[tuple[re.Match, str]]:

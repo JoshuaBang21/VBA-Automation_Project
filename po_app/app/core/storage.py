@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS my_po_header (
     flow_type       TEXT,
     floorset        TEXT,
     total_order_units INTEGER,
-    hand_over       TEXT,
+    hand_over       DATE,
     validated       INTEGER,      -- 1 = 자기검증 통과, 0 = 강제저장(override)
     confirmed_by    TEXT,
     confirmed_at    TEXT,

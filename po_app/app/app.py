@@ -50,6 +50,15 @@ from core.storage import (
 from core.validator import upcharge_check, validate
 
 
+def _format_hand_over(value: str | None) -> str | None:
+    if not value:
+        return value
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%m/%d/%y")
+    except ValueError:
+        return value
+
+
 def _format_excel_fob(writer: pd.ExcelWriter) -> None:
     """Keep FOB values visible with two decimal places in exported workbooks."""
     worksheet = writer.sheets.get("PO_Line")
@@ -251,7 +260,7 @@ for po_no, item in st.session_state.results.items():
         }.get(item.get("save_status"), "확인 필요"),
         "PDF 수정일시": item.get("source_modified_at"),
         "Style": item["parsed"].header.style_no,
-        "HO": item["parsed"].header.hand_over,
+        "HO": _format_hand_over(item["parsed"].header.hand_over),
         "Color 수": len(r.color_checks),
         "COLOR SUMMARY 합": r.sum_of_colors,
         "TOTAL ORDER SUMMARY": r.order_units,
@@ -353,7 +362,7 @@ current_headers = pd.DataFrame([
         "selling_channel": item["parsed"].header.selling_channel,
         "flow_type": item["parsed"].header.flow_type,
         "floorset": item["parsed"].header.floorset,
-        "hand_over": item["parsed"].header.hand_over,
+        "hand_over": _format_hand_over(item["parsed"].header.hand_over),
         "total_order_units": item["parsed"].header.total_order_units,
         "validation_status": item["result"].status,
         "filename": item["filename"],
@@ -498,8 +507,12 @@ try:
     if headers_df.empty:
         st.caption("아직 저장된 PO가 없습니다.")
     else:
+        headers_display_df = headers_df.copy()
+        headers_display_df["hand_over"] = pd.to_datetime(
+            headers_display_df["hand_over"], format="%Y-%m-%d", errors="coerce"
+        )
         st.dataframe(
-            headers_df.style.set_table_styles(
+            headers_display_df.style.set_table_styles(
                 [{"selector": "th", "props": [("text-align", "center")]}]
             ).set_properties(
                 **{"text-align": "center"}
@@ -512,9 +525,13 @@ try:
         lines_df = load_all_lines()
         validation_df = load_all_validation()
         upcharge_df = load_all_upcharge()
+        headers_excel_df = headers_df.copy()
+        headers_excel_df["hand_over"] = headers_excel_df["hand_over"].map(
+            _format_hand_over
+        )
         excel_buffer = BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            headers_df.to_excel(writer, sheet_name="PO_Header", index=False)
+            headers_excel_df.to_excel(writer, sheet_name="PO_Header", index=False)
             lines_df.to_excel(writer, sheet_name="PO_Line", index=False)
             validation_df.to_excel(writer, sheet_name="PO_Validation", index=False)
             upcharge_df.to_excel(writer, sheet_name="Upcharge_Review", index=False)
