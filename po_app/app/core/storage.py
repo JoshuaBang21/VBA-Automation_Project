@@ -278,13 +278,25 @@ def load_all_headers(db_path: str = DB_PATH) -> pd.DataFrame:
         conn.close()
 
 
+def list_distinct_style_no(db_path: str = DB_PATH) -> list[str]:
+    """저장된 PO에서 중복 없는 Style 번호 목록을 오름차순으로 반환한다."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT style_no FROM my_po_header ORDER BY style_no"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
 def search_style_summary(
-    style_no: str,
+    style_nos: str | list[str],
     ho_start: str | None = None,
     ho_end: str | None = None,
     db_path: str = DB_PATH,
 ) -> pd.DataFrame:
-    """Style + Hand Over 기간으로 Color/HO/수량 요약을 검색한다.
+    """Style(복수 가능) + Hand Over 기간으로 Color/HO/수량 요약을 검색한다.
 
     my_po_line은 Color/Size/pack_type별로 여러 행이 있으므로, 같은
     Style-Color-HO 조합의 qty를 합산하면 해당 조합의 총수량이 된다.
@@ -294,20 +306,32 @@ def search_style_summary(
     정확한 납기별 수량을 보여주기 위함이다.
     ho_start/ho_end는 "YYYY-MM-DD" (hand_over 저장 형식과 동일)여야 한다.
     """
+    if isinstance(style_nos, str):
+        style_nos = [style_nos]
+    style_nos = [s for s in style_nos if s]
+    empty_cols = [
+        "style_no", "color_code", "color_name", "hand_over",
+        "po_count", "po_list", "total_qty",
+    ]
+    if not style_nos:
+        return pd.DataFrame(columns=empty_cols)
+
     conn = get_connection(db_path)
     try:
-        query = """
+        placeholders = ", ".join("?" for _ in style_nos)
+        query = f"""
             SELECT h.style_no AS style_no,
                    l.color_code AS color_code,
                    l.color_name AS color_name,
                    l.hand_over AS hand_over,
                    COUNT(DISTINCT h.po_no) AS po_count,
+                   GROUP_CONCAT(DISTINCT h.po_no) AS po_list,
                    SUM(l.qty) AS total_qty
             FROM my_po_header h
             JOIN my_po_line l ON l.po_no = h.po_no
-            WHERE h.style_no = ?
+            WHERE h.style_no IN ({placeholders})
         """
-        params: list = [style_no]
+        params: list = list(style_nos)
         if ho_start:
             query += " AND l.hand_over >= ?"
             params.append(ho_start)
@@ -316,9 +340,14 @@ def search_style_summary(
             params.append(ho_end)
         query += """
             GROUP BY h.style_no, l.color_code, l.color_name, l.hand_over
-            ORDER BY l.hand_over, l.color_code
+            ORDER BY h.style_no, l.color_code, l.hand_over
         """
-        return pd.read_sql_query(query, conn, params=params)
+        df = pd.read_sql_query(query, conn, params=params)
+        if not df.empty:
+            df["po_list"] = df["po_list"].apply(
+                lambda s: ", ".join(sorted(s.split(","), key=lambda x: int(x))) if s else s
+            )
+        return df
     finally:
         conn.close()
 

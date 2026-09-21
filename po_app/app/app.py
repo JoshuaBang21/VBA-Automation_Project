@@ -41,6 +41,7 @@ if str(_THIS_DIR) not in sys.path:
 from core.constants import DEFAULT_UPCHARGE_THRESHOLD, SIZE_ORDER
 from core.parser import PoParseError, parse_po_pdf
 from core.storage import (
+    list_distinct_style_no,
     load_all_headers,
     load_all_lines,
     load_all_upcharge,
@@ -528,7 +529,7 @@ with tab_history:
             headers_display_df = headers_df.copy()
             headers_display_df["hand_over"] = pd.to_datetime(
                 headers_display_df["hand_over"], format="%Y-%m-%d", errors="coerce"
-            )
+            ).dt.date
             st.dataframe(
                 headers_display_df.style.set_table_styles(
                     [{"selector": "th", "props": [("text-align", "center")]}]
@@ -582,7 +583,13 @@ with tab_history:
 
 with tab_search:
     st.caption("Style과 Hand Over 기간으로 저장된 PO를 검색해 Color·납기별 수량을 요약합니다.")
-    search_style_no = st.text_input("Style 번호", key="search_style_no")
+    try:
+        style_options = list_distinct_style_no()
+    except Exception:
+        style_options = []
+    search_style_nos = st.multiselect(
+        "Style 번호 (복수 선택 가능)", options=style_options, key="search_style_nos"
+    )
     ho_range = st.date_input(
         "HO 기간 (비워두면 전체 기간)",
         value=(),
@@ -590,8 +597,8 @@ with tab_search:
     )
 
     if st.button("검색", key="search_style_summary_btn", use_container_width=True):
-        if not search_style_no.strip():
-            st.warning("Style 번호를 입력해 주세요.")
+        if not search_style_nos:
+            st.warning("Style 번호를 하나 이상 선택해 주세요.")
         else:
             ho_start = ho_end = None
             if isinstance(ho_range, (list, tuple)):
@@ -603,7 +610,7 @@ with tab_search:
                 ho_start = ho_end = ho_range.strftime("%Y-%m-%d")
 
             summary_df = search_style_summary(
-                search_style_no.strip(), ho_start=ho_start, ho_end=ho_end
+                search_style_nos, ho_start=ho_start, ho_end=ho_end
             )
             st.session_state["style_summary_result"] = summary_df
 
@@ -613,16 +620,21 @@ with tab_search:
             st.caption("검색 결과가 없습니다.")
         else:
             summary_display_df = summary_df.copy()
-            summary_display_df["hand_over"] = summary_display_df["hand_over"].map(
-                _format_hand_over
-            )
+            # 문자열(MM/DD/YY)로 바꾸면 표에서 정렬 시 사전순으로 뒤섞이므로
+            # 실제 date 타입을 유지해 날짜만 표시(시간 없음)하면서 정렬도 올바르게 한다.
+            summary_display_df["hand_over"] = pd.to_datetime(
+                summary_display_df["hand_over"], format="%Y-%m-%d", errors="coerce"
+            ).dt.date
+            summary_display_df = summary_display_df[
+                ["style_no", "color_name", "hand_over", "total_qty", "po_count", "po_list"]
+            ]
             summary_display_df = summary_display_df.rename(
                 columns={
                     "style_no": "Style",
-                    "color_code": "Color Code",
                     "color_name": "Color Name",
                     "hand_over": "HO",
                     "po_count": "PO 건수",
+                    "po_list": "PO 번호목록",
                     "total_qty": "수량",
                 }
             )

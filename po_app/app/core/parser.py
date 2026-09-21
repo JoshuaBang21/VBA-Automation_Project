@@ -225,13 +225,23 @@ def _extract_block_size_pairs(block_text: str) -> list[tuple[str, int]] | None:
         return None
     country = first_label_m.group(0).split("-")[0].strip()
     labels = re.findall(rf"{re.escape(country)}\s*-\s*[A-Za-z]+(?:\s+Tall)?", block_text)
-    qty_m = re.search(
-        r"\nQty/Size(?!:)\s+((?:\d[\d,]*\s+){1,}\d[\d,]*)",
-        block_text,
-    )
-    if not qty_m:
+    qty_start_m = re.search(r"\nQty/Size(?!:)\s+", block_text)
+    if not qty_start_m:
         return None
-    quantities = _number_tokens(qty_m.group(1))
+    # Tall 사이즈(예: US - XL Tall)는 SKU 줄 뒤로 줄바꿈되어 이어지는 경우가 있어
+    # "Qty/Size" 뒤 첫 줄만 보면 마지막 수량을 놓친다. 그렇다고 블록 끝까지 전부
+    # 스캔하면 PREPACK의 "Qty/PPK" 줄이나 페이지 하단 약관/PAGE 번호에 있는
+    # 숫자까지 섞여 들어온다. 따라서 이런 경계 표시가 나오기 전까지만 스캔한다.
+    boundary_m = re.search(
+        r"\n(?:Qty/PPK|SKU|The terms and conditions|PURCHASE ORDER|BLK PACKAGING|Size:)",
+        block_text[qty_start_m.end():],
+    )
+    qty_section = (
+        block_text[qty_start_m.end():qty_start_m.end() + boundary_m.start()]
+        if boundary_m
+        else block_text[qty_start_m.end():]
+    )
+    quantities = _number_tokens(qty_section)
     if len(labels) != len(quantities):
         return None
     return list(zip(labels, quantities))
@@ -260,15 +270,19 @@ def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, list[dict]]]:
         color_m = re.search(r"\n(?:PACK\s+)?\d+\s+\d+\s+(\d+)\s+", block)
         if not color_m:
             continue
-        qty_m = re.search(
-            r"\nQty/Size(?!:)\s+((?:\d[\d,]*\s+){1,}\d[\d,]*)",
-            block,
-        )
-        if not qty_m:
-            continue
-        quantities = _number_tokens(qty_m.group(1))
-        if not quantities:
-            continue
+        label_pairs = _extract_block_size_pairs(block)
+        if label_pairs is not None:
+            quantities = [q for _, q in label_pairs]
+        else:
+            qty_m = re.search(
+                r"\nQty/Size(?!:)\s+((?:\d[\d,]*\s+){1,}\d[\d,]*)",
+                block,
+            )
+            if not qty_m:
+                continue
+            quantities = _number_tokens(qty_m.group(1))
+            if not quantities:
+                continue
 
         kind = "PREPACK" if match.group("kind") == "PRE" else "BULK"
         total_line_qty = None
@@ -291,7 +305,6 @@ def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, list[dict]]]:
             if ho_m
             else None
         )
-        label_pairs = _extract_block_size_pairs(block)
 
         color_blocks = blocks.setdefault(color_m.group(1), {})
         kind_blocks = color_blocks.setdefault(kind, [])
@@ -492,7 +505,8 @@ def parse_line_page(
         # 폴백해 수량 정확성을 항상 보장한다.
         use_block_specs = bool(line_specs) and block_sum == color_size_totals
         if not use_block_specs:
-            if color_pack_blocks:
+            row_count = sum(len(color_pack_blocks.get(kind, [])) for kind in ("PREPACK", "BULK"))
+            if row_count > 1:
                 info_notes.append(
                     f"Color {color_code}: PO ROW 블록별 Hand Over/Pack 구분에 실패해 "
                     "대표 Hand Over로 처리했습니다 (Size 합계는 정상)."
