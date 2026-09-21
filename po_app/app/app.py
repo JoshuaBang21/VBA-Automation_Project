@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 from io import BytesIO
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -46,6 +46,7 @@ from core.storage import (
     load_all_upcharge,
     load_all_validation,
     save_po,
+    search_style_summary,
 )
 from core.validator import upcharge_check, validate
 
@@ -227,333 +228,404 @@ if sources:
             st.error(f"❌ {Path(filename).name}: {message}")
             st.session_state.processed_upload_hashes.add(file_hash)
 
-if not st.session_state.results:
+has_results = bool(st.session_state.results)
+if not has_results:
     st.info("PO PDF를 업로드하면 자동으로 파싱·검증됩니다.")
-    st.stop()
 
 
 # ---------------------------------------------------------------------------
 # 상단 요약 대시보드 (경고등)
 # ---------------------------------------------------------------------------
-def _reset_po_upload():
-    st.session_state.results = {}
-    st.session_state.confirmed = set()
-    st.session_state.processed_upload_hashes = set()
-    st.session_state.upload_widget_version += 1
+if has_results:
+    def _reset_po_upload():
+        st.session_state.results = {}
+        st.session_state.confirmed = set()
+        st.session_state.processed_upload_hashes = set()
+        st.session_state.upload_widget_version += 1
 
 
-st.button("초기화", key="reset_po_upload", on_click=_reset_po_upload)
-st.subheader("1️⃣ 검증 요약")
+    st.button("초기화", key="reset_po_upload", on_click=_reset_po_upload)
+    st.subheader("1️⃣ 검증 요약")
 
-summary_rows = []
-for po_no, item in st.session_state.results.items():
-    r = item["result"]
-    icon = {"OK": "🟢", "WARN": "🟡", "FAIL": "🔴"}[r.status]
-    size_level_ok = all(c.ok for c in r.color_checks) if r.color_checks else False
-    summary_rows.append({
-        "상태": icon,
-        "PO번호": po_no,
-        "데이터 상태": {
-            "saved": "최신 저장",
-            "unchanged": "최신 유지",
-            "old": "이전 파일 - 저장 안 함",
-        }.get(item.get("save_status"), "확인 필요"),
-        "PDF 수정일시": item.get("source_modified_at"),
-        "Style": item["parsed"].header.style_no,
-        "HO": _format_hand_over(item["parsed"].header.hand_over),
-        "Color 수": len(r.color_checks),
-        "COLOR SUMMARY 합": r.sum_of_colors,
-        "TOTAL ORDER SUMMARY": r.order_units,
-        "Size별합계일치": "OK" if size_level_ok else "불일치",
-        "PO전체합계일치": "OK" if r.color_sum_vs_order_ok else "불일치",
-        "확인(CFM) 완료": "✅" if po_no in st.session_state.confirmed else "",
-        "파일명": item["filename"],
-    })
-
-summary_df = pd.DataFrame(summary_rows)
-
-
-def _highlight_status(row):
-    # 기본 바탕은 검은색 + 흰 글씨, 상태(🟡/🔴)만 눈에 띄게 색 강조
-    status_bg = {"🟢": "#000000", "🟡": "#7A5B00", "🔴": "#7A0010"}.get(row["상태"], "#000000")
-    return [f"background-color: {status_bg}; color: #FFFFFF;"] * len(row)
-
-
-st.dataframe(
-    summary_df.style.set_table_styles(
-        [{"selector": "th", "props": [("text-align", "center")]}]
-    ).set_properties(
-        **{"background-color": "#000000", "color": "#FFFFFF", "text-align": "center"}
-    ).format(
-        {
-            "COLOR SUMMARY 합": "{:,.0f}",
-            "TOTAL ORDER SUMMARY": "{:,.0f}",
-        },
-        na_rep="",
-    )
-                     .set_properties(
-                         subset=["COLOR SUMMARY 합", "TOTAL ORDER SUMMARY"],
-                         **{"text-align": "right"},
-                     )
-                     .set_properties(
-                         subset=[
-                             "Style",
-                             "HO",
-                             "Color 수",
-                             "Size별합계일치",
-                             "PO전체합계일치",
-                         ],
-                         **{"text-align": "center"},
-                     )
-                     .apply(_highlight_status, axis=1),
-    hide_index=True,
-    use_container_width=True,
-)
-
-n_fail = sum(1 for it in st.session_state.results.values() if it["result"].status != "OK")
-if n_fail:
-    st.warning(f"🔴 {n_fail}건이 자기검증 실패/경고 상태입니다. 아래에서 상세 확인하세요.")
-else:
-    st.success("🟢 전체 PO가 자기검증을 통과했습니다.")
-
-# 전체 PO 통합 Color×Size CSV 다운로드 (PO별이 아니라 업로드된 전체 PO를 한 파일로)
-all_lines_df = pd.concat(
-    [item["df"].assign(파일명=item["filename"]) for item in st.session_state.results.values()],
-    ignore_index=True,
-)
-st.download_button(
-    "📥 전체 PO 통합 Color×Size CSV 다운로드",
-    data=all_lines_df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="ALL_PO_color_size.csv",
-    mime="text/csv",
-    key="dl_all_po",
-)
-
-current_validation_rows = []
-current_upcharge_frames = []
-for po_no, item in st.session_state.results.items():
-    parsed = item["parsed"]
-    result = item["result"]
-    for check in result.color_checks:
-        current_validation_rows.append({
-            "po_no": po_no,
-            "color_code": check.color_code,
-            "color_name": check.color_name,
-            "size_sum": check.size_sum,
-            "total_color_qty": check.total_color_qty,
-            "size_check_ok": check.ok,
-            "color_sum_vs_order_ok": result.color_sum_vs_order_ok,
-            "sum_of_colors": result.sum_of_colors,
-            "order_units": result.order_units,
-            "status": result.status,
-            "parse_warnings": "\n".join(result.parse_warnings),
-            "info_notes": "\n".join(result.info_notes),
+    summary_rows = []
+    for po_no, item in st.session_state.results.items():
+        r = item["result"]
+        icon = {"OK": "🟢", "WARN": "🟡", "FAIL": "🔴"}[r.status]
+        size_level_ok = all(c.ok for c in r.color_checks) if r.color_checks else False
+        summary_rows.append({
+            "상태": icon,
+            "PO번호": po_no,
+            "데이터 상태": {
+                "saved": "최신 저장",
+                "unchanged": "최신 유지",
+                "old": "이전 파일 - 저장 안 함",
+            }.get(item.get("save_status"), "확인 필요"),
+            "PDF 수정일시": item.get("source_modified_at"),
+            "Style": item["parsed"].header.style_no,
+            "HO": _format_hand_over(item["parsed"].header.hand_over),
+            "Color 수": len(r.color_checks),
+            "COLOR SUMMARY 합": r.sum_of_colors,
+            "TOTAL ORDER SUMMARY": r.order_units,
+            "Size별합계일치": "OK" if size_level_ok else "불일치",
+            "PO전체합계일치": "OK" if r.color_sum_vs_order_ok else "불일치",
+            "확인(CFM) 완료": "✅" if po_no in st.session_state.confirmed else "",
+            "파일명": item["filename"],
         })
-    if not item["upcharge_df"].empty:
-        current_upcharge_frames.append(item["upcharge_df"])
 
-current_headers = pd.DataFrame([
-    {
-        "po_no": po_no,
-        "style_no": item["parsed"].header.style_no,
-        "factory_code": item["parsed"].header.factory_code,
-        "factory_name": item["parsed"].header.factory_name,
-        "channel_type": item["parsed"].header.channel_type,
-        "selling_channel": item["parsed"].header.selling_channel,
-        "flow_type": item["parsed"].header.flow_type,
-        "floorset": item["parsed"].header.floorset,
-        "hand_over": _format_hand_over(item["parsed"].header.hand_over),
-        "total_order_units": item["parsed"].header.total_order_units,
-        "validation_status": item["result"].status,
-        "filename": item["filename"],
-        "save_status": item.get("save_status"),
-        "source_modified_at": item.get("source_modified_at"),
-    }
-    for po_no, item in st.session_state.results.items()
-])
-current_lines = pd.concat(
-    [
-        item["df"].assign(filename=item["filename"])
-        for item in st.session_state.results.values()
-    ],
-    ignore_index=True,
-)
-current_validation = pd.DataFrame(current_validation_rows)
-current_upcharge = (
-    pd.concat(current_upcharge_frames, ignore_index=True)
-    if current_upcharge_frames else pd.DataFrame()
-)
-current_excel = BytesIO()
-with pd.ExcelWriter(current_excel, engine="openpyxl") as writer:
-    current_headers.to_excel(writer, sheet_name="PO_Header", index=False)
-    current_lines.to_excel(writer, sheet_name="PO_Line", index=False)
-    current_validation.to_excel(writer, sheet_name="PO_Validation", index=False)
-    current_upcharge.to_excel(writer, sheet_name="Upcharge_Review", index=False)
-    _format_excel_fob(writer)
+    summary_df = pd.DataFrame(summary_rows)
 
-# ---------------------------------------------------------------------------
-# PO별 상세 + CFM
-# ---------------------------------------------------------------------------
-st.subheader("2️⃣ PO별 상세 확인 및 CFM")
 
-for po_no, item in st.session_state.results.items():
-    parsed, result, df, up_df = item["parsed"], item["result"], item["df"], item["upcharge_df"]
-    icon = {"OK": "🟢", "WARN": "🟡", "FAIL": "🔴"}[result.status]
+    def _highlight_status(row):
+        # 기본 바탕은 검은색 + 흰 글씨, 상태(🟡/🔴)만 눈에 띄게 색 강조
+        status_bg = {"🟢": "#000000", "🟡": "#7A5B00", "🔴": "#7A0010"}.get(row["상태"], "#000000")
+        return [f"background-color: {status_bg}; color: #FFFFFF;"] * len(row)
 
-    with st.expander(f"{icon} PO {po_no} — {parsed.header.style_no or '?'} "
-                      f"({parsed.header.selling_channel})"):
 
-        col1, col2 = st.columns([2, 1])
+    st.dataframe(
+        summary_df.style.set_table_styles(
+            [{"selector": "th", "props": [("text-align", "center")]}]
+        ).set_properties(
+            **{"background-color": "#000000", "color": "#FFFFFF", "text-align": "center"}
+        ).format(
+            {
+                "COLOR SUMMARY 합": "{:,.0f}",
+                "TOTAL ORDER SUMMARY": "{:,.0f}",
+            },
+            na_rep="",
+        )
+                         .set_properties(
+                             subset=["COLOR SUMMARY 합", "TOTAL ORDER SUMMARY"],
+                             **{"text-align": "right"},
+                         )
+                         .set_properties(
+                             subset=[
+                                 "Style",
+                                 "HO",
+                                 "Color 수",
+                                 "Size별합계일치",
+                                 "PO전체합계일치",
+                             ],
+                             **{"text-align": "center"},
+                         )
+                         .apply(_highlight_status, axis=1),
+        hide_index=True,
+        use_container_width=True,
+    )
 
-        with col1:
-            st.markdown("**Color × Size 수량 (Line 레벨)**")
-            pivot = df.pivot_table(
-                index=["color_code", "color_name"], columns="size_code",
-                values="qty", aggfunc="sum", fill_value=0,
-            )
-            ordered_cols = [c for c in SIZE_ORDER if c in pivot.columns]
-            pivot = pivot[ordered_cols]
-            pivot["합계(계산)"] = pivot.sum(axis=1)
+    n_fail = sum(1 for it in st.session_state.results.values() if it["result"].status != "OK")
+    if n_fail:
+        st.warning(f"🔴 {n_fail}건이 자기검증 실패/경고 상태입니다. 아래에서 상세 확인하세요.")
+    else:
+        st.success("🟢 전체 PO가 자기검증을 통과했습니다.")
 
-            # 원본 Total Color Qty 대조 + 하이라이트
-            orig_totals = df.drop_duplicates("color_code").set_index("color_code")["total_color_qty"]
-            pivot_reset = pivot.reset_index()
-            pivot_reset["TotalColorQty(원본)"] = pivot_reset["color_code"].map(orig_totals)
-            pivot_reset["일치"] = pivot_reset["합계(계산)"] == pivot_reset["TotalColorQty(원본)"]
+    # 전체 PO 통합 Color×Size CSV 다운로드 (PO별이 아니라 업로드된 전체 PO를 한 파일로)
+    all_lines_df = pd.concat(
+        [item["df"].assign(파일명=item["filename"]) for item in st.session_state.results.values()],
+        ignore_index=True,
+    )
+    st.download_button(
+        "📥 전체 PO 통합 Color×Size CSV 다운로드",
+        data=all_lines_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="ALL_PO_color_size.csv",
+        mime="text/csv",
+        key="dl_all_po",
+    )
 
-            def _hl(row):
-                bg = "#000000" if row["일치"] else "#7A0010"
-                return [f"background-color: {bg}; color: #FFFFFF;"] * len(row)
+    current_validation_rows = []
+    current_upcharge_frames = []
+    for po_no, item in st.session_state.results.items():
+        parsed = item["parsed"]
+        result = item["result"]
+        for check in result.color_checks:
+            current_validation_rows.append({
+                "po_no": po_no,
+                "color_code": check.color_code,
+                "color_name": check.color_name,
+                "size_sum": check.size_sum,
+                "total_color_qty": check.total_color_qty,
+                "size_check_ok": check.ok,
+                "color_sum_vs_order_ok": result.color_sum_vs_order_ok,
+                "sum_of_colors": result.sum_of_colors,
+                "order_units": result.order_units,
+                "status": result.status,
+                "parse_warnings": "\n".join(result.parse_warnings),
+                "info_notes": "\n".join(result.info_notes),
+            })
+        if not item["upcharge_df"].empty:
+            current_upcharge_frames.append(item["upcharge_df"])
 
-            st.dataframe(
-                pivot_reset.style.set_properties(**{"background-color": "#000000", "color": "#FFFFFF"})
-                                  .apply(_hl, axis=1),
-                use_container_width=True, hide_index=True,
-            )
+    current_headers = pd.DataFrame([
+        {
+            "po_no": po_no,
+            "style_no": item["parsed"].header.style_no,
+            "factory_code": item["parsed"].header.factory_code,
+            "factory_name": item["parsed"].header.factory_name,
+            "channel_type": item["parsed"].header.channel_type,
+            "selling_channel": item["parsed"].header.selling_channel,
+            "flow_type": item["parsed"].header.flow_type,
+            "floorset": item["parsed"].header.floorset,
+            "hand_over": _format_hand_over(item["parsed"].header.hand_over),
+            "total_order_units": item["parsed"].header.total_order_units,
+            "validation_status": item["result"].status,
+            "filename": item["filename"],
+            "save_status": item.get("save_status"),
+            "source_modified_at": item.get("source_modified_at"),
+        }
+        for po_no, item in st.session_state.results.items()
+    ])
+    current_lines = pd.concat(
+        [
+            item["df"].assign(filename=item["filename"])
+            for item in st.session_state.results.values()
+        ],
+        ignore_index=True,
+    )
+    current_validation = pd.DataFrame(current_validation_rows)
+    current_upcharge = (
+        pd.concat(current_upcharge_frames, ignore_index=True)
+        if current_upcharge_frames else pd.DataFrame()
+    )
+    current_excel = BytesIO()
+    with pd.ExcelWriter(current_excel, engine="openpyxl") as writer:
+        current_headers.to_excel(writer, sheet_name="PO_Header", index=False)
+        current_lines.to_excel(writer, sheet_name="PO_Line", index=False)
+        current_validation.to_excel(writer, sheet_name="PO_Validation", index=False)
+        current_upcharge.to_excel(writer, sheet_name="Upcharge_Review", index=False)
+        _format_excel_fob(writer)
 
-        with col2:
-            size_level_ok = all(c.ok for c in result.color_checks) if result.color_checks else False
-            validation_summary, validation_checks = st.columns([1, 1])
-            with validation_summary:
-                st.markdown("**PO 자기검증**")
-                st.metric("COLOR SUMMARY 합계", result.sum_of_colors)
-                st.metric("TOTAL ORDER SUMMARY", result.order_units)
-            with validation_checks:
-                st.markdown("&nbsp;", unsafe_allow_html=True)
-                st.metric(
-                    "Size별 합계 일치 (Color별)",
-                    "OK ✅" if size_level_ok else "불일치 ❌",
+    # ---------------------------------------------------------------------------
+    # PO별 상세 + CFM
+    # ---------------------------------------------------------------------------
+    st.subheader("2️⃣ PO별 상세 확인 및 CFM")
+
+    for po_no, item in st.session_state.results.items():
+        parsed, result, df, up_df = item["parsed"], item["result"], item["df"], item["upcharge_df"]
+        icon = {"OK": "🟢", "WARN": "🟡", "FAIL": "🔴"}[result.status]
+
+        with st.expander(f"{icon} PO {po_no} — {parsed.header.style_no or '?'} "
+                          f"({parsed.header.selling_channel})"):
+
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                st.markdown("**Color × Size 수량 (Line 레벨)**")
+                pivot = df.pivot_table(
+                    index=["color_code", "color_name"], columns="size_code",
+                    values="qty", aggfunc="sum", fill_value=0,
                 )
-                st.metric(
-                    "PO 전체 합계 일치 (Order Summary)",
-                    "OK ✅" if result.color_sum_vs_order_ok else "불일치 ❌",
-                )
+                ordered_cols = [c for c in SIZE_ORDER if c in pivot.columns]
+                pivot = pivot[ordered_cols]
+                pivot["합계(계산)"] = pivot.sum(axis=1)
 
-            if result.parse_warnings:
-                st.markdown("**🔴 파싱 실패 (FAIL — Size/Qty 추출 자체가 안 됨, LLM 재파싱 필요)**")
-                for w in result.parse_warnings:
-                    st.write(f"- {w}")
-            if result.info_notes:
-                st.markdown("**🟡 참고 (WARN — Size/Qty 정확성과는 무관)**")
-                for w in result.info_notes:
-                    st.write(f"- {w}")
+                # 원본 Total Color Qty 대조 + 하이라이트
+                orig_totals = df.drop_duplicates("color_code").set_index("color_code")["total_color_qty"]
+                pivot_reset = pivot.reset_index()
+                pivot_reset["TotalColorQty(원본)"] = pivot_reset["color_code"].map(orig_totals)
+                pivot_reset["일치"] = pivot_reset["합계(계산)"] == pivot_reset["TotalColorQty(원본)"]
 
-        st.markdown(f"**업차지 검토 (L 포함 이상 사이즈 비율 > {threshold_pct}%)**")
-        override = False
-        upcharge_table, cfm_action = st.columns([5, 1])
-        if not up_df.empty:
-            flagged = up_df[up_df["needs_upcharge_review"]]
-            up_show = up_df.copy()
-            up_show["over_l_ratio"] = (up_show["over_l_ratio"] * 100).round(1).astype(str) + "%"
+                def _hl(row):
+                    bg = "#000000" if row["일치"] else "#7A0010"
+                    return [f"background-color: {bg}; color: #FFFFFF;"] * len(row)
 
-            def _hl_up(row):
-                is_flag = row["needs_upcharge_review"]
-                bg = "#000000"
-                fg = "#FFFFFF"
-                if is_flag:
-                    return [f"background-color: {bg}; color: {fg};" for _ in row]
-                return [f"background-color: {bg}; color: {fg};" for _ in row]
-
-            with upcharge_table:
                 st.dataframe(
-                    up_show.style.apply(_hl_up, axis=1),
+                    pivot_reset.style.set_properties(**{"background-color": "#000000", "color": "#FFFFFF"})
+                                      .apply(_hl, axis=1),
                     use_container_width=True, hide_index=True,
                 )
-            if len(flagged):
-                with upcharge_table:
-                    st.warning(
-                        f"⚠️ {len(flagged)}개 Color가 업차지 검토 대상입니다 "
-                        f"({threshold_pct}% 초과)."
+
+            with col2:
+                size_level_ok = all(c.ok for c in result.color_checks) if result.color_checks else False
+                validation_summary, validation_checks = st.columns([1, 1])
+                with validation_summary:
+                    st.markdown("**PO 자기검증**")
+                    st.metric("COLOR SUMMARY 합계", result.sum_of_colors)
+                    st.metric("TOTAL ORDER SUMMARY", result.order_units)
+                with validation_checks:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    st.metric(
+                        "Size별 합계 일치 (Color별)",
+                        "OK ✅" if size_level_ok else "불일치 ❌",
                     )
+                    st.metric(
+                        "PO 전체 합계 일치 (Order Summary)",
+                        "OK ✅" if result.color_sum_vs_order_ok else "불일치 ❌",
+                    )
+
+                if result.parse_warnings:
+                    st.markdown("**🔴 파싱 실패 (FAIL — Size/Qty 추출 자체가 안 됨, LLM 재파싱 필요)**")
+                    for w in result.parse_warnings:
+                        st.write(f"- {w}")
+                if result.info_notes:
+                    st.markdown("**🟡 참고 (WARN — Size/Qty 정확성과는 무관)**")
+                    for w in result.info_notes:
+                        st.write(f"- {w}")
+
+            st.markdown(f"**업차지 검토 (L 포함 이상 사이즈 비율 > {threshold_pct}%)**")
+            override = False
+            upcharge_table, cfm_action = st.columns([5, 1])
+            if not up_df.empty:
+                flagged = up_df[up_df["needs_upcharge_review"]]
+                up_show = up_df.copy()
+                up_show["over_l_ratio"] = (up_show["over_l_ratio"] * 100).round(1).astype(str) + "%"
+
+                def _hl_up(row):
+                    is_flag = row["needs_upcharge_review"]
+                    bg = "#000000"
+                    fg = "#FFFFFF"
+                    if is_flag:
+                        return [f"background-color: {bg}; color: {fg};" for _ in row]
+                    return [f"background-color: {bg}; color: {fg};" for _ in row]
+
+                with upcharge_table:
+                    st.dataframe(
+                        up_show.style.apply(_hl_up, axis=1),
+                        use_container_width=True, hide_index=True,
+                    )
+                if len(flagged):
+                    with upcharge_table:
+                        st.warning(
+                            f"⚠️ {len(flagged)}개 Color가 업차지 검토 대상입니다 "
+                            f"({threshold_pct}% 초과)."
+                        )
+            else:
+                with upcharge_table:
+                    st.write("데이터 없음")
+
+            with cfm_action:
+                save_labels = {
+                    "saved": "자동 저장 완료",
+                    "unchanged": "최신 데이터 유지",
+                    "old": "이전 파일 - 저장 안 함",
+                }
+                st.caption(save_labels.get(item.get("save_status"), "저장 상태 확인"))
+
+
+# ---------------------------------------------------------------------------
+# 저장된 PO 조회 (my_po_header) / Style·HO 검색
+# ---------------------------------------------------------------------------
+tab_history, tab_search = st.tabs(["3️⃣ 저장된 PO 이력", "🔍 Style/HO 검색 (TEST)"])
+
+with tab_history:
+    try:
+        headers_df = load_all_headers()
+        if headers_df.empty:
+            st.caption("아직 저장된 PO가 없습니다.")
         else:
-            with upcharge_table:
-                st.write("데이터 없음")
-
-        with cfm_action:
-            save_labels = {
-                "saved": "자동 저장 완료",
-                "unchanged": "최신 데이터 유지",
-                "old": "이전 파일 - 저장 안 함",
-            }
-            st.caption(save_labels.get(item.get("save_status"), "저장 상태 확인"))
-
-
-# ---------------------------------------------------------------------------
-# 저장된 PO 조회 (my_po_header)
-# ---------------------------------------------------------------------------
-st.subheader("3️⃣ 저장된 PO 이력 (my_po_header)")
-try:
-    headers_df = load_all_headers()
-    if headers_df.empty:
-        st.caption("아직 저장된 PO가 없습니다.")
-    else:
-        headers_display_df = headers_df.copy()
-        headers_display_df["hand_over"] = pd.to_datetime(
-            headers_display_df["hand_over"], format="%Y-%m-%d", errors="coerce"
-        )
-        st.dataframe(
-            headers_display_df.style.set_table_styles(
-                [{"selector": "th", "props": [("text-align", "center")]}]
-            ).set_properties(
-                **{"text-align": "center"}
-            ).set_properties(
-                subset=["total_order_units"],
-                **{"text-align": "right"},
-            ),
-            use_container_width=True,
-        )
-        lines_df = load_all_lines()
-        validation_df = load_all_validation()
-        upcharge_df = load_all_upcharge()
-        headers_excel_df = headers_df.copy()
-        headers_excel_df["hand_over"] = headers_excel_df["hand_over"].map(
-            _format_hand_over
-        )
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            headers_excel_df.to_excel(writer, sheet_name="PO_Header", index=False)
-            lines_df.to_excel(writer, sheet_name="PO_Line", index=False)
-            validation_df.to_excel(writer, sheet_name="PO_Validation", index=False)
-            upcharge_df.to_excel(writer, sheet_name="Upcharge_Review", index=False)
-            _format_excel_fob(writer)
-        current_download, saved_download = st.columns(2)
-        with current_download:
-            st.download_button(
-                "📄 현재 화면 PO만 Excel로 다운로드",
-                data=current_excel.getvalue(),
-                file_name="current_po.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_current_po_excel",
+            headers_display_df = headers_df.copy()
+            headers_display_df["hand_over"] = pd.to_datetime(
+                headers_display_df["hand_over"], format="%Y-%m-%d", errors="coerce"
+            )
+            st.dataframe(
+                headers_display_df.style.set_table_styles(
+                    [{"selector": "th", "props": [("text-align", "center")]}]
+                ).set_properties(
+                    **{"text-align": "center"}
+                ).set_properties(
+                    subset=["total_order_units"],
+                    **{"text-align": "right"},
+                ),
                 use_container_width=True,
             )
-        with saved_download:
-            st.download_button(
-                "📚 전체 누적 PO를 Excel로 다운로드",
-                data=excel_buffer.getvalue(),
-                file_name=f"{datetime.now().strftime('%m%d%y')}_TOTAL_PO.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_saved_po_excel",
-                use_container_width=True,
+            lines_df = load_all_lines()
+            validation_df = load_all_validation()
+            upcharge_df = load_all_upcharge()
+            headers_excel_df = headers_df.copy()
+            headers_excel_df["hand_over"] = headers_excel_df["hand_over"].map(
+                _format_hand_over
             )
-except Exception as e:  # DB 파일이 아직 없을 때 등
-    st.caption(f"저장 이력 없음 ({e})")
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                headers_excel_df.to_excel(writer, sheet_name="PO_Header", index=False)
+                lines_df.to_excel(writer, sheet_name="PO_Line", index=False)
+                validation_df.to_excel(writer, sheet_name="PO_Validation", index=False)
+                upcharge_df.to_excel(writer, sheet_name="Upcharge_Review", index=False)
+                _format_excel_fob(writer)
+            if has_results:
+                current_download, saved_download = st.columns(2)
+            else:
+                saved_download = st.container()
+            if has_results:
+                with current_download:
+                    st.download_button(
+                        "📄 현재 화면 PO만 Excel로 다운로드",
+                        data=current_excel.getvalue(),
+                        file_name="current_po.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_current_po_excel",
+                        use_container_width=True,
+                    )
+            with saved_download:
+                st.download_button(
+                    "📚 전체 누적 PO를 Excel로 다운로드",
+                    data=excel_buffer.getvalue(),
+                    file_name=f"{datetime.now().strftime('%m%d%y')}_TOTAL_PO.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_saved_po_excel",
+                    use_container_width=True,
+                )
+    except Exception as e:  # DB 파일이 아직 없을 때 등
+        st.caption(f"저장 이력 없음 ({e})")
+
+with tab_search:
+    st.caption("Style과 Hand Over 기간으로 저장된 PO를 검색해 Color·납기별 수량을 요약합니다.")
+    search_style_no = st.text_input("Style 번호", key="search_style_no")
+    ho_range = st.date_input(
+        "HO 기간 (비워두면 전체 기간)",
+        value=(),
+        key="search_ho_range",
+    )
+
+    if st.button("검색", key="search_style_summary_btn", use_container_width=True):
+        if not search_style_no.strip():
+            st.warning("Style 번호를 입력해 주세요.")
+        else:
+            ho_start = ho_end = None
+            if isinstance(ho_range, (list, tuple)):
+                if len(ho_range) >= 1 and isinstance(ho_range[0], date):
+                    ho_start = ho_range[0].strftime("%Y-%m-%d")
+                if len(ho_range) >= 2 and isinstance(ho_range[1], date):
+                    ho_end = ho_range[1].strftime("%Y-%m-%d")
+            elif isinstance(ho_range, date):
+                ho_start = ho_end = ho_range.strftime("%Y-%m-%d")
+
+            summary_df = search_style_summary(
+                search_style_no.strip(), ho_start=ho_start, ho_end=ho_end
+            )
+            st.session_state["style_summary_result"] = summary_df
+
+    summary_df = st.session_state.get("style_summary_result")
+    if summary_df is not None:
+        if summary_df.empty:
+            st.caption("검색 결과가 없습니다.")
+        else:
+            summary_display_df = summary_df.copy()
+            summary_display_df["hand_over"] = summary_display_df["hand_over"].map(
+                _format_hand_over
+            )
+            summary_display_df = summary_display_df.rename(
+                columns={
+                    "style_no": "Style",
+                    "color_code": "Color Code",
+                    "color_name": "Color Name",
+                    "hand_over": "HO",
+                    "po_count": "PO 건수",
+                    "total_qty": "수량",
+                }
+            )
+            st.dataframe(
+                summary_display_df.style.set_table_styles(
+                    [{"selector": "th", "props": [("text-align", "center")]}]
+                ).set_properties(
+                    **{"text-align": "center"}
+                ).set_properties(
+                    subset=["수량"],
+                    **{"text-align": "right"},
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                f"총 수량: {int(summary_df['total_qty'].sum()):,}  "
+                f"|  PO 건수(중복포함): {int(summary_df['po_count'].sum()):,}"
+            )
+

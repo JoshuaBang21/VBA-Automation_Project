@@ -275,6 +275,47 @@ def load_all_headers(db_path: str = DB_PATH) -> pd.DataFrame:
         conn.close()
 
 
+def search_style_summary(
+    style_no: str,
+    ho_start: str | None = None,
+    ho_end: str | None = None,
+    db_path: str = DB_PATH,
+) -> pd.DataFrame:
+    """Style + Hand Over 기간으로 Color/HO/수량 요약을 검색한다.
+
+    my_po_line은 Color/Size/pack_type별로 여러 행이 있으므로, 같은
+    Style-Color-HO 조합의 qty를 합산하면 해당 조합의 총수량이 된다.
+    ho_start/ho_end는 "YYYY-MM-DD" (hand_over 저장 형식과 동일)여야 한다.
+    """
+    conn = get_connection(db_path)
+    try:
+        query = """
+            SELECT h.style_no AS style_no,
+                   l.color_code AS color_code,
+                   l.color_name AS color_name,
+                   h.hand_over AS hand_over,
+                   COUNT(DISTINCT h.po_no) AS po_count,
+                   SUM(l.qty) AS total_qty
+            FROM my_po_header h
+            JOIN my_po_line l ON l.po_no = h.po_no
+            WHERE h.style_no = ?
+        """
+        params: list = [style_no]
+        if ho_start:
+            query += " AND h.hand_over >= ?"
+            params.append(ho_start)
+        if ho_end:
+            query += " AND h.hand_over <= ?"
+            params.append(ho_end)
+        query += """
+            GROUP BY h.style_no, l.color_code, l.color_name, h.hand_over
+            ORDER BY h.hand_over, l.color_code
+        """
+        return pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
+
+
 def load_lines(po_no: str, db_path: str = DB_PATH) -> pd.DataFrame:
     conn = get_connection(db_path)
     try:
