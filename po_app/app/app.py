@@ -433,6 +433,20 @@ if has_results:
                     use_container_width=True, hide_index=True,
                 )
 
+                if df["hand_over"].nunique(dropna=True) > 1:
+                    st.markdown("**🟡 분할 출고(Hand Over) — Color × 배송분별 수량**")
+                    ho_pivot = df.groupby(
+                        ["color_code", "color_name", "hand_over"], as_index=False
+                    )["qty"].sum()
+                    ho_pivot["hand_over"] = ho_pivot["hand_over"].map(_format_hand_over)
+                    ho_pivot = ho_pivot.rename(columns={
+                        "color_code": "Color Code",
+                        "color_name": "Color Name",
+                        "hand_over": "HO",
+                        "qty": "수량",
+                    }).sort_values(["Color Code", "HO"])
+                    st.dataframe(ho_pivot, use_container_width=True, hide_index=True)
+
             with col2:
                 size_level_ok = all(c.ok for c in result.color_checks) if result.color_checks else False
                 validation_summary, validation_checks = st.columns([1, 1])

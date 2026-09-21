@@ -56,6 +56,7 @@ class PoLine:
     qty: int
     total_color_qty: int
     total_line_qty: int | None
+    hand_over: str | None = None  # 이 라인(PO ROW/배송분)의 실제 Hand Over (분할 출고 대응)
 
 
 @dataclass
@@ -149,19 +150,33 @@ _HAND_OVER_RE = re.compile(
 )
 
 
-def _extract_hand_over(pages: list[str]) -> str | None:
+def _extract_hand_over(pages: list[str]) -> tuple[str | None, str | None]:
+    """PDF 전체의 Hand Over 날짜를 모아 대표값과 분할 출고 안내 메모를 반환한다.
+
+    같은 PO/Color 안에서도 배송분(PO ROW)마다 Hand Over가 다를 수 있다
+    (분할 출고, 예: PO 1390937 "split ship line 1 with 12.9 HO"). 이를
+    에러로 막지 않고, PO_Header에는 가장 이른 날짜를 대표값으로 저장하며
+    실제 배송분별 정확한 날짜는 my_po_line.hand_over에 남긴다.
+    """
     dates = []
     for page in pages:
         dates.extend(match.group(2) for match in _HAND_OVER_RE.finditer(page))
-    unique_dates = set(dates)
-    if len(unique_dates) > 1:
-        raise PoParseError(
-            "PO 내 Hand Over 날짜가 Color/상품별로 서로 다릅니다 — "
-            "PO_Header 단일 날짜로 저장할 수 없습니다."
-        )
     if not dates:
-        return None
-    return datetime.strptime(dates[0], "%m/%d/%y").strftime("%Y-%m-%d")
+        return None, None
+    unique_dates = sorted(set(dates), key=lambda d: datetime.strptime(d, "%m/%d/%y"))
+    primary = unique_dates[0]
+    note = None
+    if len(unique_dates) > 1:
+        note = (
+            "PO 내 Hand Over 날짜가 여러 개입니다 (분할 출고 가능성): "
+            + ", ".join(unique_dates)
+            + " — PO_Header에는 최초 날짜만 대표로 표시되며, 실제 배송분별 날짜는 "
+            "저장된 PO 라인(색상별 상세)에서 확인해야 합니다."
+        )
+    return (
+        datetime.strptime(primary, "%m/%d/%y").strftime("%Y-%m-%d"),
+        note,
+    )
 
 
 def _extract_color_segments(page_text: str) -> list[tuple[re.Match, str]]:
@@ -199,13 +214,41 @@ def _number_tokens(text: str) -> list[int]:
     ]
 
 
-def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, dict]]:
-    """Collect PREPACK/BULK row quantities by color across the whole PDF.
+def _extract_block_size_pairs(block_text: str) -> list[tuple[str, int]] | None:
+    """PRE/BULK 블록 자체의 Size 라벨과 Qty/Size 수량을 짝짓는다.
+
+    COLOR SUMMARY 전체 라벨이 아니라 이 블록(PO ROW)만의 라벨을 쓴다 —
+    분할 출고 시 배송분마다 사이즈 구성(예: XS~XXL vs S~XL)이 다를 수 있어서다.
+    """
+    first_label_m = re.search(RAW_SIZE_LABEL_RE, block_text)
+    if not first_label_m:
+        return None
+    country = first_label_m.group(0).split("-")[0].strip()
+    labels = re.findall(rf"{re.escape(country)}\s*-\s*[A-Za-z]+(?:\s+Tall)?", block_text)
+    qty_m = re.search(
+        r"\nQty/Size(?!:)\s+((?:\d[\d,]*\s+){1,}\d[\d,]*)",
+        block_text,
+    )
+    if not qty_m:
+        return None
+    quantities = _number_tokens(qty_m.group(1))
+    if len(labels) != len(quantities):
+        return None
+    return list(zip(labels, quantities))
+
+
+def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, list[dict]]]:
+    """Collect PREPACK/BULK PO ROW blocks by color across the whole PDF.
 
     A COLOR SUMMARY can be on the next page after its PO ROW, so this is
     intentionally collected before individual pages are parsed.
+
+    한 Color 안에 같은 kind(PREPACK/BULK)의 PO ROW가 여러 개 있을 수 있다:
+      1) 완전히 같은 Hand Over/사이즈 구성으로 나뉜 행 -> 합산한다 (PO 1390983).
+      2) 분할 출고(split ship)로 Hand Over가 서로 다른 행 -> 별도 배송분으로
+         남겨 my_po_line에 각자의 Hand Over를 붙인다 (PO 1390937).
     """
-    blocks: dict[str, dict[str, dict]] = {}
+    blocks: dict[str, dict[str, list[dict]]] = {}
     document = "\n\f\n".join(pages)
     block_re = re.compile(
         r"(?P<kind>PRE|BULK) Class Style No\. Color Design Color.*?"
@@ -242,22 +285,49 @@ def _extract_pack_blocks(pages: list[str]) -> dict[str, dict[str, dict]]:
         if line_m:
             total_line_qty = _clean_num(line_m.group(1))
 
+        ho_m = _HAND_OVER_RE.search(block)
+        hand_over = (
+            datetime.strptime(ho_m.group(2), "%m/%d/%y").strftime("%Y-%m-%d")
+            if ho_m
+            else None
+        )
+        label_pairs = _extract_block_size_pairs(block)
+
         color_blocks = blocks.setdefault(color_m.group(1), {})
-        existing = color_blocks.get(kind)
-        if existing is None:
-            color_blocks[kind] = {
+        kind_blocks = color_blocks.setdefault(kind, [])
+
+        merged = False
+        for existing in kind_blocks:
+            existing_pairs = existing.get("pairs")
+            if label_pairs is not None and existing_pairs is not None:
+                same_shape = [lbl for lbl, _ in existing_pairs] == [
+                    lbl for lbl, _ in label_pairs
+                ]
+            else:
+                same_shape = len(existing["quantities"]) == len(quantities)
+            if same_shape and existing.get("hand_over") == hand_over:
+                existing["quantities"] = [
+                    previous + current
+                    for previous, current in zip(existing["quantities"], quantities)
+                ]
+                if existing_pairs is not None and label_pairs is not None:
+                    existing["pairs"] = [
+                        (lbl, prev_q + cur_q)
+                        for (lbl, prev_q), (_, cur_q) in zip(existing_pairs, label_pairs)
+                    ]
+                if total_line_qty is not None:
+                    existing["total_line_qty"] = (
+                        (existing["total_line_qty"] or 0) + total_line_qty
+                    )
+                merged = True
+                break
+        if not merged:
+            kind_blocks.append({
                 "quantities": quantities,
+                "pairs": label_pairs,
                 "total_line_qty": total_line_qty,
-            }
-        elif len(existing["quantities"]) == len(quantities):
-            existing["quantities"] = [
-                previous + current
-                for previous, current in zip(existing["quantities"], quantities)
-            ]
-            if total_line_qty is not None:
-                existing["total_line_qty"] = (
-                    (existing["total_line_qty"] or 0) + total_line_qty
-                )
+                "hand_over": hand_over,
+            })
     return blocks
 
 
@@ -404,34 +474,33 @@ def parse_line_page(
             continue
 
         color_pack_blocks = pack_blocks.get(color_code, {})
-        line_specs = []
-        if (
-            color_pack_blocks.get("PREPACK")
-            and color_pack_blocks.get("BULK")
-            and len(color_pack_blocks["PREPACK"]["quantities"]) == len(pairs)
-            and len(color_pack_blocks["BULK"]["quantities"]) == len(pairs)
-        ):
-            for kind in ("PREPACK", "BULK"):
-                block = color_pack_blocks[kind]
-                line_specs.append(
-                    (
-                        kind,
-                        block["quantities"],
-                        block["total_line_qty"],
-                    )
-                )
-        else:
-            block = color_pack_blocks.get(pack_type)
-            line_specs.append(
-                (
-                    pack_type,
-                    [q for _, q in pairs],
-                    block["total_line_qty"] if block else total_line_qty,
-                )
-            )
+        color_size_totals = dict(pairs)
+        line_specs = []  # (pack_type, hand_over, [(lbl, qty), ...], total_line_qty)
+        block_sum: dict[str, int] = {}
+        for kind in ("PREPACK", "BULK"):
+            for sub in color_pack_blocks.get(kind, []):
+                sub_pairs = sub.get("pairs")
+                if sub_pairs is None:
+                    continue
+                for lbl, q in sub_pairs:
+                    block_sum[lbl] = block_sum.get(lbl, 0) + q
+                line_specs.append((kind, sub.get("hand_over"), sub_pairs, sub.get("total_line_qty")))
 
-        for line_pack_type, quantities, line_total in line_specs:
-            for (lbl, _), q in zip(pairs, quantities):
+        # 블록(PO ROW) 단위 라벨/수량이 COLOR SUMMARY 합계와 정확히 일치할 때만
+        # 사용한다 — 분할 출고(Hand Over가 다른 여러 PO ROW) 등 복잡한 케이스를
+        # 정확히 반영하되, 어긋나면 안전하게 COLOR SUMMARY 기준 단일 라인으로
+        # 폴백해 수량 정확성을 항상 보장한다.
+        use_block_specs = bool(line_specs) and block_sum == color_size_totals
+        if not use_block_specs:
+            if color_pack_blocks:
+                info_notes.append(
+                    f"Color {color_code}: PO ROW 블록별 Hand Over/Pack 구분에 실패해 "
+                    "대표 Hand Over로 처리했습니다 (Size 합계는 정상)."
+                )
+            line_specs = [(pack_type, header.hand_over, pairs, total_line_qty)]
+
+        for line_pack_type, line_hand_over, size_pairs, line_total in line_specs:
+            for lbl, q in size_pairs:
                 std_size = SIZE_MAP.get(lbl)
                 if std_size is None:
                     warnings.append(f"미매핑 사이즈 라벨 '{lbl}' 발견 (SIZE_MAP에 추가 필요).")
@@ -448,6 +517,7 @@ def parse_line_page(
                     qty=q,
                     total_color_qty=total_color_qty,
                     total_line_qty=line_total,
+                    hand_over=line_hand_over or header.hand_over,
                 ))
 
     # If the page starts the next product after its own COLOR SUMMARY, carry
@@ -464,7 +534,7 @@ def parse_po_pdf(pdf_bytes: bytes, filename: str = "") -> ParsedPo:
     """PO PDF 1건 전체 파싱 (헤더 + 모든 Color/Size 라인)."""
     pages = extract_pages_text(pdf_bytes)
     header = parse_header(pages[0])
-    header.hand_over = _extract_hand_over(pages)
+    header.hand_over, hand_over_note = _extract_hand_over(pages)
     if header.hand_over is None:
         raise PoParseError(
             f"{filename}: Hand Over 날짜를 찾지 못했습니다 — 납기준수일 확인이 필요합니다."
@@ -473,6 +543,8 @@ def parse_po_pdf(pdf_bytes: bytes, filename: str = "") -> ParsedPo:
     all_lines: list[PoLine] = []
     all_warnings: list[str] = []
     all_info_notes: list[str] = []
+    if hand_over_note:
+        all_info_notes.append(hand_over_note)
     context: dict = {}
     context["pack_blocks"] = _extract_pack_blocks(pages)
     for page_text in pages[1:]:

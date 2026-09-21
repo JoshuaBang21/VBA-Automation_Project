@@ -69,6 +69,7 @@ def to_dataframe(parsed: ParsedPo) -> pd.DataFrame:
             "qty": ln.qty,
             "total_color_qty": ln.total_color_qty,
             "total_line_qty": ln.total_line_qty,
+            "hand_over": ln.hand_over,
         })
     return pd.DataFrame(rows)
 

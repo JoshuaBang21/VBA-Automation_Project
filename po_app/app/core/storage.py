@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS my_po_line (
     qty             INTEGER,
     total_color_qty INTEGER,
     total_line_qty INTEGER,
+    hand_over       DATE,
     FOREIGN KEY (po_no) REFERENCES my_po_header(po_no)
 );
 
@@ -95,6 +96,8 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     line_columns = {row[1] for row in conn.execute("PRAGMA table_info(my_po_line)")}
     if "total_line_qty" not in line_columns:
         conn.execute("ALTER TABLE my_po_line ADD COLUMN total_line_qty INTEGER")
+    if "hand_over" not in line_columns:
+        conn.execute("ALTER TABLE my_po_line ADD COLUMN hand_over DATE")
     conn.commit()
     return conn
 
@@ -209,7 +212,7 @@ def save_po(
 
         line_cols = ["color_code", "color_name", "design_color", "sub_channel",
                      "pack_type", "fob", "size_code", "qty", "total_color_qty",
-                     "total_line_qty"]
+                     "total_line_qty", "hand_over"]
         for _, r in df_line.iterrows():
             conn.execute(
                 f"""INSERT INTO my_po_line (po_no, {", ".join(line_cols)})
@@ -285,6 +288,10 @@ def search_style_summary(
 
     my_po_line은 Color/Size/pack_type별로 여러 행이 있으므로, 같은
     Style-Color-HO 조합의 qty를 합산하면 해당 조합의 총수량이 된다.
+    HO는 my_po_line.hand_over(라인/배송분 단위) 기준으로 집계한다 — 분할
+    출고(같은 PO/Color 안에 Hand Over가 여러 개인 경우, PO_Header에는 대표
+    날짜만 남지만 my_po_line에는 배송분별 정확한 날짜가 저장된다) 시에도
+    정확한 납기별 수량을 보여주기 위함이다.
     ho_start/ho_end는 "YYYY-MM-DD" (hand_over 저장 형식과 동일)여야 한다.
     """
     conn = get_connection(db_path)
@@ -293,7 +300,7 @@ def search_style_summary(
             SELECT h.style_no AS style_no,
                    l.color_code AS color_code,
                    l.color_name AS color_name,
-                   h.hand_over AS hand_over,
+                   l.hand_over AS hand_over,
                    COUNT(DISTINCT h.po_no) AS po_count,
                    SUM(l.qty) AS total_qty
             FROM my_po_header h
@@ -302,18 +309,19 @@ def search_style_summary(
         """
         params: list = [style_no]
         if ho_start:
-            query += " AND h.hand_over >= ?"
+            query += " AND l.hand_over >= ?"
             params.append(ho_start)
         if ho_end:
-            query += " AND h.hand_over <= ?"
+            query += " AND l.hand_over <= ?"
             params.append(ho_end)
         query += """
-            GROUP BY h.style_no, l.color_code, l.color_name, h.hand_over
-            ORDER BY h.hand_over, l.color_code
+            GROUP BY h.style_no, l.color_code, l.color_name, l.hand_over
+            ORDER BY l.hand_over, l.color_code
         """
         return pd.read_sql_query(query, conn, params=params)
     finally:
         conn.close()
+
 
 
 def load_lines(po_no: str, db_path: str = DB_PATH) -> pd.DataFrame:
